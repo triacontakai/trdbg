@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <system_error>
 #include <sys/ptrace.h>
+#include <sys/signalfd.h>
 #include <sys/wait.h>
 #include <type_traits>
 #include <unistd.h>
@@ -123,6 +124,19 @@ auto Amd64Registers::end() -> Iterator {
     return Iterator(this, REGISTER_ORDER.size());
 }
 
+Linux64Backend::~Linux64Backend() {
+    // don't leave a traced process behind
+    if (pid_ != 0 && ::kill(pid_, SIGKILL) == 0) {
+        while (pid_ != 0 && wait())
+            ;
+    }
+
+    if (signal_fd_ != -1) {
+        loop_.unwatch(signal_fd_watch_);
+        close(signal_fd_);
+    }
+}
+
 std::expected<void, BackendError> Linux64Backend::launch(std::string_view path, std::span<const std::string> args) {
     // if we are already running, disallow running again
     if (pid_ != 0)
@@ -135,6 +149,9 @@ std::expected<void, BackendError> Linux64Backend::launch(std::string_view path, 
     for (auto const& arg : args)
         argv.push_back(const_cast<char *>(arg.c_str()));
     argv.push_back(nullptr);
+
+    if (auto ok = setup_child_events(); !ok)
+        return ok;
 
     int pipe_fds[2];
     if (pipe2(pipe_fds, O_CLOEXEC) == -1)
@@ -151,6 +168,10 @@ std::expected<void, BackendError> Linux64Backend::launch(std::string_view path, 
     if (pid == 0) {
         // child
         close(pipe_fds[0]);
+
+        // signal mask survives execve, so put back the one from before we blocked SIGCHLD
+        sigprocmask(SIG_SETMASK, &original_mask_, nullptr);
+
         if (ptrace(PTRACE_TRACEME) == 0)
             execvp(argv[0], argv.data());
 
@@ -187,7 +208,7 @@ std::expected<void, BackendError> Linux64Backend::attach(int pid) {
 }
 
 std::expected<void, BackendError> Linux64Backend::resume() {
-    if (auto ok = ensure_stopped(); !ok)
+    if (auto ok = check_stopped(); !ok)
         return ok;
 
     if (ptrace(PTRACE_CONT, pid_, 0, pending_signal_) == -1)
@@ -199,7 +220,7 @@ std::expected<void, BackendError> Linux64Backend::resume() {
 }
 
 std::expected<void, BackendError> Linux64Backend::step() {
-    if (auto ok = ensure_stopped(); !ok)
+    if (auto ok = check_stopped(); !ok)
         return ok;
 
     if (ptrace(PTRACE_SINGLESTEP, pid_, 0, pending_signal_) == -1)
@@ -210,10 +231,73 @@ std::expected<void, BackendError> Linux64Backend::step() {
     return {};
 }
 
-std::expected<StopEvent, BackendError> Linux64Backend::wait() {
+std::expected<void, BackendError> Linux64Backend::interrupt() {
+    return send_signal(SIGSTOP);
+}
+
+std::expected<void, BackendError> Linux64Backend::kill() {
     if (pid_ == 0)
         return std::unexpected(ERROR_NOT_RUNNING);
 
+    if (::kill(pid_, SIGKILL) == -1)
+        return errno_error();
+
+    stopped_ = false;
+    return {};
+}
+
+void Linux64Backend::on_event(std::function<void(StopEvent)> handler) {
+    event_handler_ = std::move(handler);
+}
+
+auto Linux64Backend::get_registers() -> std::expected<registers, BackendError> {
+    if (auto ok = check_stopped(); !ok)
+        return std::unexpected(ok.error());
+
+    registers regs;
+    if (ptrace(PTRACE_GETREGS, pid_, 0, &regs.regs_) == -1)
+        return errno_error();
+
+    return regs;
+}
+
+std::expected<void, BackendError> Linux64Backend::set_registers(const registers& regs) {
+    if (auto ok = check_stopped(); !ok)
+        return ok;
+
+    if (ptrace(PTRACE_SETREGS, pid_, 0, &regs.regs_) == -1)
+        return errno_error();
+
+    return {};
+}
+
+std::expected<void, BackendError> Linux64Backend::send_signal(int signal) {
+    if (pid_ == 0)
+        return std::unexpected(ERROR_NOT_RUNNING);
+
+    if (::kill(pid_, signal) == -1)
+        return errno_error();
+
+    return {};
+}
+
+void Linux64Backend::handle_signal_fd() {
+    // drain before waitpid, so a SIGCHLD that shows up in between leaves the fd readable
+    // SIGCHLDs get merged anyway so we don't care what's in them
+    signalfd_siginfo info;
+    while (read(signal_fd_, &info, sizeof(info)) > 0) {}
+
+    // the handler might resume the process, so keep going until nothing is left
+    int status;
+    while (pid_ != 0 && waitpid(pid_, &status, WNOHANG) > 0) {
+        StopEvent event = handle_status(status);
+        if (event_handler_)
+            event_handler_(event);
+    }
+}
+
+// blocking wait that skips the event loop, for when we need the result right away
+std::expected<StopEvent, BackendError> Linux64Backend::wait() {
     int status;
     int ret;
     do {
@@ -223,6 +307,10 @@ std::expected<StopEvent, BackendError> Linux64Backend::wait() {
     if (ret == -1)
         return errno_error();
 
+    return handle_status(status);
+}
+
+StopEvent Linux64Backend::handle_status(int status) {
     if (WIFEXITED(status)) {
         pid_ = 0;
         stopped_ = false;
@@ -244,56 +332,29 @@ std::expected<StopEvent, BackendError> Linux64Backend::wait() {
     return StopEvent{StopEvent::Reason::Stopped, signal};
 }
 
-std::expected<void, BackendError> Linux64Backend::interrupt() {
-    return send_signal(SIGSTOP);
-}
+std::expected<void, BackendError> Linux64Backend::setup_child_events() {
+    if (signal_fd_ != -1)
+        return {};
 
-std::expected<void, BackendError> Linux64Backend::kill() {
-    if (pid_ == 0)
-        return std::unexpected(ERROR_NOT_RUNNING);
+    // SIGCHLD has to be blocked for signalfd to receive it
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
+    if (int err = pthread_sigmask(SIG_BLOCK, &mask, &original_mask_); err != 0)
+        return errno_error(err);
 
-    if (::kill(pid_, SIGKILL) == -1)
-        return errno_error();
+    signal_fd_ = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
+    if (signal_fd_ == -1) {
+        int err = errno;
+        pthread_sigmask(SIG_SETMASK, &original_mask_, nullptr);
+        return errno_error(err);
+    }
 
-    // reap the process
-    if (auto event = wait(); !event)
-        return std::unexpected(event.error());
-
+    signal_fd_watch_ = loop_.watch_fd(signal_fd_, [this] { handle_signal_fd(); });
     return {};
 }
 
-auto Linux64Backend::get_registers() -> std::expected<registers, BackendError> {
-    if (auto ok = ensure_stopped(); !ok)
-        return std::unexpected(ok.error());
-
-    registers regs;
-    if (ptrace(PTRACE_GETREGS, pid_, 0, &regs.regs_) == -1)
-        return errno_error();
-
-    return regs;
-}
-
-std::expected<void, BackendError> Linux64Backend::set_registers(const registers& regs) {
-    if (auto ok = ensure_stopped(); !ok)
-        return ok;
-
-    if (ptrace(PTRACE_SETREGS, pid_, 0, &regs.regs_) == -1)
-        return errno_error();
-
-    return {};
-}
-
-std::expected<void, BackendError> Linux64Backend::send_signal(int signal) {
-    if (pid_ == 0)
-        return std::unexpected(ERROR_NOT_RUNNING);
-
-    if (::kill(pid_, signal) == -1)
-        return errno_error();
-
-    return {};
-}
-
-std::expected<void, BackendError> Linux64Backend::ensure_stopped() const {
+std::expected<void, BackendError> Linux64Backend::check_stopped() const {
     if (pid_ == 0)
         return std::unexpected(ERROR_NOT_RUNNING);
     if (!stopped_)

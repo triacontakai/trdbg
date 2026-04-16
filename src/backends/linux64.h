@@ -2,14 +2,17 @@
 #define BACKENDS_LINUX_H_
 
 #include <cstddef>
+#include <functional>
 #include <iterator>
 #include <span>
 #include <string>
 #include <string_view>
+#include <signal.h>
 #include <unistd.h>
 #include <sys/user.h>
 
 #include "backend.h"
+#include "event_loop.h"
 
 namespace tdb::backends {
 
@@ -57,14 +60,23 @@ class Linux64Backend {
 public:
     using registers = Amd64Registers;
 
+    explicit Linux64Backend(EventLoop& loop) : loop_(loop) {};
+    Linux64Backend(const Linux64Backend&) = delete;
+    Linux64Backend& operator=(const Linux64Backend&) = delete;
+    ~Linux64Backend();
+
     std::expected<void, BackendError> launch(std::string_view path, std::span<const std::string> args);
     std::expected<void, BackendError> attach(int pid);
 
     std::expected<void, BackendError> resume();
     std::expected<void, BackendError> step();
-    std::expected<StopEvent, BackendError> wait();
     std::expected<void, BackendError> interrupt();
+    // the exit shows up as a Killed event like any other
     std::expected<void, BackendError> kill();
+
+    // handler runs on the event loop thread whenever the process stops/exits/gets killed
+    // SIGCHLD gets blocked on the thread that calls launch(), so do that before spawning other threads
+    void on_event(std::function<void(StopEvent)> handler);
 
     std::expected<registers, BackendError> get_registers();
     std::expected<void, BackendError> set_registers(const registers& regs);
@@ -72,12 +84,24 @@ public:
     std::expected<void, BackendError> send_signal(int signal);
 
 private:
-    std::expected<void, BackendError> ensure_stopped() const;
+    std::expected<void, BackendError> check_stopped() const;
+    std::expected<void, BackendError> setup_child_events();
+    void handle_signal_fd();
+    std::expected<StopEvent, BackendError> wait();
+    StopEvent handle_status(int status);
+
+    EventLoop& loop_;
+    std::function<void(StopEvent)> event_handler_;
 
     pid_t pid_ = 0;
     bool stopped_ = false;
     // signal to deliver on next resume/step
     int pending_signal_ = 0;
+
+    int signal_fd_ = -1;
+    EventLoop::Handle signal_fd_watch_;
+    // signal mask from before we blocked SIGCHLD, restored in the child
+    sigset_t original_mask_;
 };
 
 }

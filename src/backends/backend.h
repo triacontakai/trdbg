@@ -4,12 +4,15 @@
 #include <concepts>
 #include <cstddef>
 #include <expected>
+#include <functional>
 #include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <tuple>
+
+#include "event_loop.h"
 
 namespace tdb::backends {
 
@@ -18,7 +21,7 @@ enum class RegisterError {
 };
 
 /**
- * Helper class for backend errors
+ * helper class for backend errors
  * main purpose is just to provide error messages to users
  */
 class BackendError {
@@ -38,7 +41,7 @@ private:
 };
 
 /**
- * Why the process stopped, returned from wait()
+ * why the process stopped, passed to the on_event() handler
  * code is the signal number for Stopped/Killed, and exit status for Exited
  */
 struct StopEvent {
@@ -66,20 +69,22 @@ concept RegisterSet =
     };
 
 template<typename T>
-concept Backend = RegisterSet<typename T::registers> && requires(
+concept Backend = RegisterSet<typename T::registers> && std::constructible_from<T, EventLoop&> && requires(
         T& x,
         const typename T::registers& registers,
         std::string_view path,
         std::span<const std::string> args,
-        int pid) {
+        int pid,
+        std::function<void(StopEvent)> handler) {
     { x.launch(path, args) } -> std::same_as<std::expected<void, BackendError>>;
     { x.attach(pid) } -> std::same_as<std::expected<void, BackendError>>;
 
     { x.resume() } -> std::same_as<std::expected<void, BackendError>>;
     { x.step() } -> std::same_as<std::expected<void, BackendError>>;
-    { x.wait() } -> std::same_as<std::expected<StopEvent, BackendError>>;
     { x.interrupt() } -> std::same_as<std::expected<void, BackendError>>;
     { x.kill() } -> std::same_as<std::expected<void, BackendError>>;
+
+    { x.on_event(handler) } -> std::same_as<void>;
 
     { x.get_registers() } -> std::same_as<std::expected<typename T::registers, BackendError>>;
     { x.set_registers(registers) } -> std::same_as<std::expected<void, BackendError>>;
