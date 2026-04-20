@@ -55,6 +55,12 @@ struct StopEvent {
     int code;
 };
 
+enum class ProcessState {
+    None,
+    Running,
+    Stopped,
+};
+
 template<typename T>
 concept RegisterSet =
     std::ranges::forward_range<T> &&
@@ -66,6 +72,7 @@ concept RegisterSet =
         { x.get_register(reg_name) } -> std::same_as<std::expected<typename T::max_register_size, RegisterError>>;
         { x.set_register(reg_name, val) } -> std::same_as<std::expected<void, RegisterError>>;
         { x.register_size(reg_name) } -> std::same_as<std::expected<std::size_t, RegisterError>>;
+        { x.pc() } -> std::same_as<typename T::max_register_size>;
     };
 
 template<typename T>
@@ -85,6 +92,7 @@ concept Backend = RegisterSet<typename T::registers> && std::constructible_from<
     { x.kill() } -> std::same_as<std::expected<void, BackendError>>;
 
     { x.on_event(handler) } -> std::same_as<void>;
+    { x.state() } -> std::same_as<ProcessState>;
 
     { x.get_registers() } -> std::same_as<std::expected<typename T::registers, BackendError>>;
     { x.set_registers(registers) } -> std::same_as<std::expected<void, BackendError>>;

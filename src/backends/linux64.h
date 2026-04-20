@@ -7,7 +7,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <signal.h>
 #include <unistd.h>
 #include <sys/user.h>
 
@@ -46,6 +45,7 @@ public:
     std::expected<max_register_size, RegisterError> get_register(std::string_view reg);
     std::expected<void, RegisterError> set_register(std::string_view reg, max_register_size value);
     std::expected<std::size_t, RegisterError> register_size(std::string_view reg_name);
+    max_register_size pc() const;
 
     Iterator begin();
     Iterator end();
@@ -77,6 +77,7 @@ public:
     // handler runs on the event loop thread whenever the process stops/exits/gets killed
     // SIGCHLD gets blocked on the thread that calls launch(), so do that before spawning other threads
     void on_event(std::function<void(StopEvent)> handler);
+    ProcessState state() const;
 
     std::expected<registers, BackendError> get_registers();
     std::expected<void, BackendError> set_registers(const registers& regs);
@@ -100,8 +101,6 @@ private:
 
     int signal_fd_ = -1;
     EventLoop::Handle signal_fd_watch_;
-    // signal mask from before we blocked SIGCHLD, restored in the child
-    sigset_t original_mask_;
 };
 
 }

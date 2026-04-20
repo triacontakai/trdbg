@@ -116,6 +116,10 @@ std::expected<std::size_t, RegisterError> Amd64Registers::register_size(std::str
         return std::unexpected(RegisterError::RegisterDoesNotExist);
 }
 
+auto Amd64Registers::pc() const -> max_register_size {
+    return regs_.rip;
+}
+
 auto Amd64Registers::begin() -> Iterator {
     return Iterator(this, 0);
 }
@@ -169,8 +173,10 @@ std::expected<void, BackendError> Linux64Backend::launch(std::string_view path, 
         // child
         close(pipe_fds[0]);
 
-        // signal mask survives execve, so put back the one from before we blocked SIGCHLD
-        sigprocmask(SIG_SETMASK, &original_mask_, nullptr);
+        // signal mask survives execve, and we (and the frontend) block signals for signalfd
+        sigset_t empty;
+        sigemptyset(&empty);
+        sigprocmask(SIG_SETMASK, &empty, nullptr);
 
         if (ptrace(PTRACE_TRACEME) == 0)
             execvp(argv[0], argv.data());
@@ -250,6 +256,14 @@ void Linux64Backend::on_event(std::function<void(StopEvent)> handler) {
     event_handler_ = std::move(handler);
 }
 
+ProcessState Linux64Backend::state() const {
+    if (pid_ == 0)
+        return ProcessState::None;
+    if (stopped_)
+        return ProcessState::Stopped;
+    return ProcessState::Running;
+}
+
 auto Linux64Backend::get_registers() -> std::expected<registers, BackendError> {
     if (auto ok = check_stopped(); !ok)
         return std::unexpected(ok.error());
@@ -324,8 +338,9 @@ StopEvent Linux64Backend::handle_status(int status) {
     }
 
     // SIGTRAP and SIGSTOP are from us, anything else should be passed on to the process
+    // except SIGINT, which we reserve for frontend use (ctrl-c interrupt)
     int signal = WSTOPSIG(status);
-    if (signal != SIGTRAP && signal != SIGSTOP)
+    if (signal != SIGTRAP && signal != SIGSTOP && signal != SIGINT)
         pending_signal_ = signal;
 
     stopped_ = true;
@@ -340,13 +355,13 @@ std::expected<void, BackendError> Linux64Backend::setup_child_events() {
     sigset_t mask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGCHLD);
-    if (int err = pthread_sigmask(SIG_BLOCK, &mask, &original_mask_); err != 0)
+    if (int err = pthread_sigmask(SIG_BLOCK, &mask, nullptr); err != 0)
         return errno_error(err);
 
     signal_fd_ = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
     if (signal_fd_ == -1) {
         int err = errno;
-        pthread_sigmask(SIG_SETMASK, &original_mask_, nullptr);
+        pthread_sigmask(SIG_UNBLOCK, &mask, nullptr);
         return errno_error(err);
     }
 
