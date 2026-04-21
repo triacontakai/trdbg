@@ -58,6 +58,7 @@ private:
     void cmd_stepi(Args args);
     void cmd_kill(Args args);
     void cmd_info(Args args);
+    void cmd_set(Args args);
     void cmd_file(Args args);
     void cmd_help(Args args);
     void cmd_quit(Args args);

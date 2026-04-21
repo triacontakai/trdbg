@@ -1,8 +1,11 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
+#include <concepts>
 #include <csignal>
 #include <cstdio>
+#include <optional>
 #include <print>
 #include <ranges>
 #include <string.h>
@@ -39,6 +42,27 @@ std::vector<std::string_view> split(std::string_view s) {
     return words;
 }
 
+// decimal, 0x hex, or negative (two's complement)
+template<std::unsigned_integral T>
+std::optional<T> parse_value(std::string_view s) {
+    bool negative = s.starts_with('-');
+    if (negative)
+        s.remove_prefix(1);
+
+    int base = 10;
+    if (s.starts_with("0x") || s.starts_with("0X")) {
+        base = 16;
+        s.remove_prefix(2);
+    }
+
+    T value;
+    auto [end, err] = std::from_chars(s.data(), s.data() + s.size(), value, base);
+    if (err != std::errc() || end != s.data() + s.size())
+        return std::nullopt;
+
+    return negative ? static_cast<T>(-value) : value;
+}
+
 // e.g. "SIGSEGV, Segmentation fault"
 std::string describe_signal(int signal) {
     const char *abbrev = sigabbrev_np(signal);
@@ -58,6 +82,7 @@ auto CliFrontend<B>::commands() -> std::span<const Command> {
         Command{"stepi", "si", "stepi", "execute one instruction", true, &CliFrontend::cmd_stepi},
         Command{"kill", "k", "kill", "kill the program", false, &CliFrontend::cmd_kill},
         Command{"info", "i", "info registers [regs...]", "show registers (\"i r\" for short)", true, &CliFrontend::cmd_info},
+        Command{"set", "", "set $<reg> = <value>", "set a register to a decimal, 0x hex, or negative value", false, &CliFrontend::cmd_set},
         Command{"file", "", "file <path>", "set the program to debug", false, &CliFrontend::cmd_file},
         Command{"help", "h", "help", "show this message", false, &CliFrontend::cmd_help},
         Command{"quit", "q", "quit", "exit tdb, killing the program if it's running", false, &CliFrontend::cmd_quit},
@@ -325,6 +350,45 @@ void CliFrontend<B>::cmd_info(Args args) {
         else
             std::println("Invalid register `{}'", name);
     }
+}
+
+template<backends::Backend B>
+void CliFrontend<B>::cmd_set(Args args) {
+    // put the words back together so "$rax=1" and "$rax = 1" both work
+    std::string assignment;
+    for (auto arg : args) {
+        assignment += arg;
+        assignment += ' ';
+    }
+
+    auto equals = assignment.find('=');
+    auto name = trim(std::string_view(assignment).substr(0, equals));
+    if (equals == std::string::npos || !name.starts_with('$')) {
+        std::println("Usage: set $<reg> = <value>");
+        return;
+    }
+    name.remove_prefix(1);
+
+    auto regs = backend_.get_registers();
+    if (!regs) {
+        std::println("{}", regs.error().message());
+        return;
+    }
+
+    auto value_str = trim(std::string_view(assignment).substr(equals + 1));
+    auto value = parse_value<typename B::registers::max_register_size>(value_str);
+    if (!value) {
+        std::println("Invalid value `{}'", value_str);
+        return;
+    }
+
+    if (!regs->set_register(name, *value)) {
+        std::println("Invalid register `{}'", name);
+        return;
+    }
+
+    if (auto ret = backend_.set_registers(*regs); !ret)
+        std::println("{}", ret.error().message());
 }
 
 template<backends::Backend B>
