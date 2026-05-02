@@ -3,6 +3,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <fcntl.h>
+#include <format>
 #include <system_error>
 #include <sys/ptrace.h>
 #include <sys/signalfd.h>
@@ -14,6 +15,7 @@
 #include <vector>
 #include "linux64.h"
 #include "backend.h"
+#include "parse.h"
 
 #define REG_INFO(reg) std::make_pair(std::string_view(#reg), offsetof(struct user_regs_struct, reg))
 
@@ -285,6 +287,26 @@ std::expected<void, BackendError> Linux64Backend::set_registers(const registers&
     return {};
 }
 
+auto Linux64Backend::parse_location(std::string_view str) -> std::expected<location, BackendError> {
+    if (auto addr = parse_integer<address>(str))
+        return location{*addr};
+
+    return std::unexpected(std::format("invalid location `{}'", str));
+}
+
+auto Linux64Backend::resolve(const location& loc) -> std::expected<address, BackendError> {
+    return loc.address;
+}
+
+std::expected<void, BackendError> Linux64Backend::read_memory(address addr, std::span<std::byte> out) {
+    return access_memory(addr, out.data(), out.size(), false);
+}
+
+std::expected<void, BackendError> Linux64Backend::write_memory(address addr, std::span<const std::byte> in) {
+    // pwrite doesn't modify buf, the cast is just so read and write can share access_memory
+    return access_memory(addr, const_cast<std::byte *>(in.data()), in.size(), true);
+}
+
 std::expected<void, BackendError> Linux64Backend::send_signal(int signal) {
     if (pid_ == 0)
         return std::unexpected(ERROR_NOT_RUNNING);
@@ -308,6 +330,34 @@ void Linux64Backend::handle_signal_fd() {
         if (event_handler_)
             event_handler_(event);
     }
+}
+
+// goes through /proc/pid/mem so we can do more than a word at a time like PTRACE_PEEKDATA
+// (writes also ignore page protections, which breakpoints will need)
+std::expected<void, BackendError> Linux64Backend::access_memory(address addr, std::byte *buf, std::size_t size, bool write) {
+    if (auto ok = check_stopped(); !ok)
+        return ok;
+
+    // opened every time since the fd goes stale if the process execs
+    int fd = open(std::format("/proc/{}/mem", pid_).c_str(), (write ? O_WRONLY : O_RDONLY) | O_CLOEXEC);
+    if (fd == -1)
+        return errno_error();
+
+    std::size_t done = 0;
+    while (done < size) {
+        auto offset = static_cast<off_t>(addr + done);
+        ssize_t n = write ? pwrite(fd, buf + done, size - done, offset) : pread(fd, buf + done, size - done, offset);
+        if (n == -1 && errno == EINTR)
+            continue;
+        if (n <= 0) {
+            close(fd);
+            return std::unexpected(std::format("cannot access memory at {:#x}", addr + done));
+        }
+        done += n;
+    }
+
+    close(fd);
+    return {};
 }
 
 // blocking wait that skips the event loop, for when we need the result right away

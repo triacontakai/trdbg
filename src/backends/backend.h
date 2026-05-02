@@ -4,6 +4,7 @@
 #include <concepts>
 #include <cstddef>
 #include <expected>
+#include <format>
 #include <functional>
 #include <ranges>
 #include <span>
@@ -61,6 +62,14 @@ enum class ProcessState {
     Stopped,
 };
 
+/**
+ * Something the user can refer to in memory, e.g. an address (later symbols, $reg+offset, etc.)
+ * comes from Backend::parse_location, and Backend::resolve turns it into an address
+ * kept separate from addresses since some locations can only be resolved once the process is running
+ */
+template<typename T>
+concept Location = std::copyable<T> && std::formattable<T, char>;
+
 template<typename T>
 concept RegisterSet =
     std::ranges::forward_range<T> &&
@@ -76,9 +85,19 @@ concept RegisterSet =
     };
 
 template<typename T>
-concept Backend = RegisterSet<typename T::registers> && std::constructible_from<T, EventLoop&> && requires(
+concept Backend =
+    RegisterSet<typename T::registers> &&
+    Location<typename T::location> &&
+    std::unsigned_integral<typename T::address> &&
+    std::constructible_from<T, EventLoop&> &&
+    requires(
         T& x,
         const typename T::registers& registers,
+        std::string_view location_str,
+        const typename T::location& location,
+        typename T::address address,
+        std::span<std::byte> out,
+        std::span<const std::byte> in,
         std::string_view path,
         std::span<const std::string> args,
         int pid,
@@ -96,6 +115,11 @@ concept Backend = RegisterSet<typename T::registers> && std::constructible_from<
 
     { x.get_registers() } -> std::same_as<std::expected<typename T::registers, BackendError>>;
     { x.set_registers(registers) } -> std::same_as<std::expected<void, BackendError>>;
+
+    { x.parse_location(location_str) } -> std::same_as<std::expected<typename T::location, BackendError>>;
+    { x.resolve(location) } -> std::same_as<std::expected<typename T::address, BackendError>>;
+    { x.read_memory(address, out) } -> std::same_as<std::expected<void, BackendError>>;
+    { x.write_memory(address, in) } -> std::same_as<std::expected<void, BackendError>>;
 };
 
 template<typename T>

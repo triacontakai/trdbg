@@ -2,6 +2,8 @@
 #define BACKENDS_LINUX_H_
 
 #include <cstddef>
+#include <cstdint>
+#include <format>
 #include <functional>
 #include <iterator>
 #include <span>
@@ -56,9 +58,16 @@ private:
     friend class Linux64Backend;
 };
 
+// only raw addresses for now, symbols etc. will go here later
+struct Linux64Location {
+    std::uint64_t address;
+};
+
 class Linux64Backend {
 public:
     using registers = Amd64Registers;
+    using location = Linux64Location;
+    using address = std::uint64_t;
 
     explicit Linux64Backend(EventLoop& loop) : loop_(loop) {};
     Linux64Backend(const Linux64Backend&) = delete;
@@ -82,6 +91,11 @@ public:
     std::expected<registers, BackendError> get_registers();
     std::expected<void, BackendError> set_registers(const registers& regs);
 
+    std::expected<location, BackendError> parse_location(std::string_view str);
+    std::expected<address, BackendError> resolve(const location& loc);
+    std::expected<void, BackendError> read_memory(address addr, std::span<std::byte> out);
+    std::expected<void, BackendError> write_memory(address addr, std::span<const std::byte> in);
+
     std::expected<void, BackendError> send_signal(int signal);
 
 private:
@@ -89,6 +103,7 @@ private:
     std::expected<void, BackendError> setup_child_events();
     void handle_signal_fd();
     std::expected<StopEvent, BackendError> wait();
+    std::expected<void, BackendError> access_memory(address addr, std::byte *buf, std::size_t size, bool write);
     StopEvent handle_status(int status);
 
     EventLoop& loop_;
@@ -104,5 +119,12 @@ private:
 };
 
 }
+
+template<>
+struct std::formatter<tdb::backends::Linux64Location> : std::formatter<std::string> {
+    auto format(const tdb::backends::Linux64Location& loc, auto& ctx) const {
+        return std::formatter<std::string>::format(std::format("{:#x}", loc.address), ctx);
+    }
+};
 
 #endif

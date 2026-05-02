@@ -1,13 +1,13 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
-#include <charconv>
-#include <concepts>
 #include <csignal>
+#include <cstddef>
 #include <cstdio>
-#include <optional>
 #include <print>
 #include <ranges>
+#include <span>
+#include <string>
 #include <string.h>
 #include <sys/signalfd.h>
 #include <unistd.h>
@@ -15,6 +15,7 @@
 #include <vector>
 #include "backends/native.h"
 #include "cli.h"
+#include "parse.h"
 
 namespace tdb::frontends {
 
@@ -42,25 +43,15 @@ std::vector<std::string_view> split(std::string_view s) {
     return words;
 }
 
-// decimal, 0x hex, or negative (two's complement)
-template<std::unsigned_integral T>
-std::optional<T> parse_value(std::string_view s) {
-    bool negative = s.starts_with('-');
-    if (negative)
-        s.remove_prefix(1);
-
-    int base = 10;
-    if (s.starts_with("0x") || s.starts_with("0X")) {
-        base = 16;
-        s.remove_prefix(2);
+// undoes split(), for commands where the args are really one string
+std::string join(std::span<const std::string_view> words) {
+    std::string joined;
+    for (auto word : words) {
+        if (!joined.empty())
+            joined += ' ';
+        joined += word;
     }
-
-    T value;
-    auto [end, err] = std::from_chars(s.data(), s.data() + s.size(), value, base);
-    if (err != std::errc() || end != s.data() + s.size())
-        return std::nullopt;
-
-    return negative ? static_cast<T>(-value) : value;
+    return joined;
 }
 
 // e.g. "SIGSEGV, Segmentation fault"
@@ -76,16 +67,17 @@ std::string describe_signal(int signal) {
 template<backends::Backend B>
 auto CliFrontend<B>::commands() -> std::span<const Command> {
     static constexpr std::array COMMANDS = {
-        Command{"run", "r", "run [args...]", "start the program, optionally with new arguments", false, &CliFrontend::cmd_run},
-        Command{"starti", "", "starti [args...]", "start the program and stop at the first instruction", false, &CliFrontend::cmd_starti},
-        Command{"continue", "c", "continue", "resume the program", true, &CliFrontend::cmd_continue},
-        Command{"stepi", "si", "stepi", "execute one instruction", true, &CliFrontend::cmd_stepi},
-        Command{"kill", "k", "kill", "kill the program", false, &CliFrontend::cmd_kill},
-        Command{"info", "i", "info registers [regs...]", "show registers (\"i r\" for short)", true, &CliFrontend::cmd_info},
-        Command{"set", "", "set $<reg> = <value>", "set a register to a decimal, 0x hex, or negative value", false, &CliFrontend::cmd_set},
-        Command{"file", "", "file <path>", "set the program to debug", false, &CliFrontend::cmd_file},
-        Command{"help", "h", "help", "show this message", false, &CliFrontend::cmd_help},
-        Command{"quit", "q", "quit", "exit tdb, killing the program if it's running", false, &CliFrontend::cmd_quit},
+        Command{"run", "r", "run [args...]", "start the program, optionally with new arguments", false, false, &CliFrontend::cmd_run},
+        Command{"starti", "", "starti [args...]", "start the program and stop at the first instruction", false, false, &CliFrontend::cmd_starti},
+        Command{"continue", "c", "continue", "resume the program", true, false, &CliFrontend::cmd_continue},
+        Command{"stepi", "si", "stepi", "execute one instruction", true, false, &CliFrontend::cmd_stepi},
+        Command{"kill", "k", "kill", "kill the program", false, false, &CliFrontend::cmd_kill},
+        Command{"info", "i", "info registers [regs...]", "show registers (\"i r\" for short)", true, false, &CliFrontend::cmd_info},
+        Command{"x", "", "x[/N] <location>", "show N bytes of memory (default 16)", false, true, &CliFrontend::cmd_examine},
+        Command{"set", "", "set[/N] $<reg>|*<location> = <value>", "set a register, or N bytes of memory (default 8)", false, true, &CliFrontend::cmd_set},
+        Command{"file", "", "file <path>", "set the program to debug", false, false, &CliFrontend::cmd_file},
+        Command{"help", "h", "help", "show this message", false, false, &CliFrontend::cmd_help},
+        Command{"quit", "q", "quit", "exit tdb, killing the program if it's running", false, false, &CliFrontend::cmd_quit},
     };
     return COMMANDS;
 }
@@ -142,7 +134,7 @@ void CliFrontend<B>::handle_input() {
     if (n <= 0) {
         // signifies user ctrl-d (EOF)
         std::println("quit");
-        cmd_quit({});
+        cmd_quit({}, {});
         return;
     }
 
@@ -182,17 +174,32 @@ void CliFrontend<B>::handle_line(std::string_view line) {
         return;
 
     auto words = split(command_line);
+
+    // "x/16" is command "x" with modifier "16"
+    std::string_view name = words[0];
+    std::string_view modifier;
+    if (auto slash = name.find('/'); slash != std::string_view::npos) {
+        modifier = name.substr(slash + 1);
+        name = name.substr(0, slash);
+    }
+
     for (auto const& command : commands()) {
-        if (words[0] != command.name && words[0] != command.alias)
+        if (name != command.name && name != command.alias)
             continue;
 
+        if (!modifier.empty() && !command.takes_modifier) {
+            last_command_ = "";
+            std::println("\"{}\" doesn't take a /modifier.", command.name);
+            return;
+        }
+
         last_command_ = command.repeatable ? command_line : "";
-        (this->*command.handler)(Args(words).subspan(1));
+        (this->*command.handler)(modifier, Args(words).subspan(1));
         return;
     }
 
     last_command_ = "";
-    std::println("Undefined command: \"{}\".  Try \"help\".", words[0]);
+    std::println("Undefined command: \"{}\".  Try \"help\".", name);
 }
 
 template<backends::Backend B>
@@ -283,7 +290,7 @@ bool CliFrontend<B>::launch(Args args) {
 }
 
 template<backends::Backend B>
-void CliFrontend<B>::cmd_run(Args args) {
+void CliFrontend<B>::cmd_run(std::string_view, Args args) {
     if (!launch(args))
         return;
 
@@ -292,31 +299,31 @@ void CliFrontend<B>::cmd_run(Args args) {
 }
 
 template<backends::Backend B>
-void CliFrontend<B>::cmd_starti(Args args) {
+void CliFrontend<B>::cmd_starti(std::string_view, Args args) {
     if (launch(args))
         print_location();
 }
 
 template<backends::Backend B>
-void CliFrontend<B>::cmd_continue(Args) {
+void CliFrontend<B>::cmd_continue(std::string_view, Args) {
     if (auto ret = backend_.resume(); !ret)
         std::println("{}", ret.error().message());
 }
 
 template<backends::Backend B>
-void CliFrontend<B>::cmd_stepi(Args) {
+void CliFrontend<B>::cmd_stepi(std::string_view, Args) {
     if (auto ret = backend_.step(); !ret)
         std::println("{}", ret.error().message());
 }
 
 template<backends::Backend B>
-void CliFrontend<B>::cmd_kill(Args) {
+void CliFrontend<B>::cmd_kill(std::string_view, Args) {
     if (auto ret = backend_.kill(); !ret)
         std::println("{}", ret.error().message());
 }
 
 template<backends::Backend B>
-void CliFrontend<B>::cmd_info(Args args) {
+void CliFrontend<B>::cmd_info(std::string_view, Args args) {
     if (args.empty() || (args[0] != "registers" && args[0] != "r")) {
         std::println("Usage: info registers [regs...]");
         return;
@@ -353,30 +360,102 @@ void CliFrontend<B>::cmd_info(Args args) {
 }
 
 template<backends::Backend B>
-void CliFrontend<B>::cmd_set(Args args) {
-    // put the words back together so "$rax=1" and "$rax = 1" both work
-    std::string assignment;
-    for (auto arg : args) {
-        assignment += arg;
-        assignment += ' ';
+void CliFrontend<B>::cmd_examine(std::string_view modifier, Args args) {
+    // cap it so a typo doesn't try to dump gigabytes
+    constexpr std::size_t MAX_COUNT = 65536;
+
+    std::size_t count = 16;
+    if (!modifier.empty()) {
+        auto n = parse_integer<std::size_t>(modifier);
+        if (!n || *n == 0 || *n > MAX_COUNT) {
+            std::println("Invalid count `{}', must be 1 to {}", modifier, MAX_COUNT);
+            return;
+        }
+        count = *n;
     }
 
-    auto equals = assignment.find('=');
-    auto name = trim(std::string_view(assignment).substr(0, equals));
-    if (equals == std::string::npos || !name.starts_with('$')) {
-        std::println("Usage: set $<reg> = <value>");
+    if (args.empty()) {
+        std::println("Usage: x[/N] <location>");
         return;
     }
-    name.remove_prefix(1);
 
+    auto location = backend_.parse_location(join(args));
+    if (!location) {
+        std::println("{}", location.error().message());
+        return;
+    }
+
+    auto address = backend_.resolve(*location);
+    if (!address) {
+        std::println("{}", address.error().message());
+        return;
+    }
+
+    std::vector<std::byte> bytes(count);
+    if (auto ret = backend_.read_memory(*address, bytes); !ret) {
+        std::println("{}", ret.error().message());
+        return;
+    }
+
+    // hexdump style, 16 bytes per row with the printable ones on the right
+    constexpr std::size_t ROW_SIZE = 16;
+    std::size_t address_width = 2 + 2 * sizeof(*address);
+    for (std::size_t row = 0; row < bytes.size(); row += ROW_SIZE) {
+        std::string hex;
+        std::string ascii;
+        for (std::size_t i = 0; i < ROW_SIZE; i++) {
+            if (i == ROW_SIZE / 2)
+                hex += ' ';
+
+            if (row + i >= bytes.size()) {
+                hex += "   ";
+                continue;
+            }
+
+            auto byte = std::to_integer<unsigned char>(bytes[row + i]);
+            hex += std::format("{:02x} ", byte);
+            ascii += (byte >= 0x20 && byte < 0x7f) ? static_cast<char>(byte) : '.';
+        }
+
+        std::println("{:#0{}x}:  {} |{}|", *address + row, address_width, hex, ascii);
+    }
+}
+
+template<backends::Backend B>
+void CliFrontend<B>::cmd_set(std::string_view modifier, Args args) {
+    // put the words back together so "$rax=1" and "$rax = 1" both work
+    std::string assignment = join(args);
+
+    auto equals = assignment.find('=');
+    auto target = trim(std::string_view(assignment).substr(0, equals));
+    if (equals == std::string::npos || target.empty()) {
+        std::println("Usage: set[/N] $<reg>|*<location> = <value>");
+        return;
+    }
+
+    auto value_str = trim(std::string_view(assignment).substr(equals + 1));
+    if (target.starts_with('$')) {
+        if (!modifier.empty()) {
+            std::println("Size can only be used with memory; must be omitted for registers");
+            return;
+        }
+        set_register(target.substr(1), value_str);
+    } else if (target.starts_with('*')) {
+        set_memory(modifier, trim(target.substr(1)), value_str);
+    } else {
+        std::println("Usage: set[/N] $<reg>|*<location> = <value>");
+    }
+}
+
+template<backends::Backend B>
+void CliFrontend<B>::set_register(std::string_view name, std::string_view value_str) {
     auto regs = backend_.get_registers();
     if (!regs) {
         std::println("{}", regs.error().message());
         return;
     }
 
-    auto value_str = trim(std::string_view(assignment).substr(equals + 1));
-    auto value = parse_value<typename B::registers::max_register_size>(value_str);
+    auto value = parse_integer<typename B::registers::max_register_size>(value_str);
     if (!value) {
         std::println("Invalid value `{}'", value_str);
         return;
@@ -392,7 +471,46 @@ void CliFrontend<B>::cmd_set(Args args) {
 }
 
 template<backends::Backend B>
-void CliFrontend<B>::cmd_file(Args args) {
+void CliFrontend<B>::set_memory(std::string_view modifier, std::string_view location_str, std::string_view value_str) {
+    std::size_t size = sizeof(typename B::address);
+    if (!modifier.empty()) {
+        auto n = parse_integer<std::size_t>(modifier);
+        if (!n || (*n != 1 && *n != 2 && *n != 4 && *n != 8)) {
+            std::println("Invalid size `{}', must be 1, 2, 4, or 8", modifier);
+            return;
+        }
+        size = *n;
+    }
+
+    auto location = backend_.parse_location(location_str);
+    if (!location) {
+        std::println("{}", location.error().message());
+        return;
+    }
+
+    auto address = backend_.resolve(*location);
+    if (!address) {
+        std::println("{}", address.error().message());
+        return;
+    }
+
+    auto value = parse_integer<std::uint64_t>(value_str);
+    if (!value) {
+        std::println("Invalid value `{}'", value_str);
+        return;
+    }
+
+    // little endian and truncated to size, fine while we only have x86 backends
+    std::array<std::byte, sizeof(*value)> bytes;
+    for (std::size_t i = 0; i < size; i++)
+        bytes[i] = static_cast<std::byte>((*value >> (8 * i)) & 0xff);
+
+    if (auto ret = backend_.write_memory(*address, std::span(bytes).first(size)); !ret)
+        std::println("{}", ret.error().message());
+}
+
+template<backends::Backend B>
+void CliFrontend<B>::cmd_file(std::string_view, Args args) {
     if (args.size() != 1) {
         std::println("Usage: file <path>");
         return;
@@ -402,7 +520,7 @@ void CliFrontend<B>::cmd_file(Args args) {
 }
 
 template<backends::Backend B>
-void CliFrontend<B>::cmd_help(Args) {
+void CliFrontend<B>::cmd_help(std::string_view, Args) {
     // columns fit the longest entry, so adding commands doesn't break the alignment
     // yes, this does recompute every time help is called - but cost should be fairly small
     auto usage_width = std::ranges::max(commands() | std::views::transform([](auto const& command) { return command.usage.size(); }));
@@ -413,7 +531,7 @@ void CliFrontend<B>::cmd_help(Args) {
 }
 
 template<backends::Backend B>
-void CliFrontend<B>::cmd_quit(Args) {
+void CliFrontend<B>::cmd_quit(std::string_view, Args) {
     // backend kills the process when it gets destroyed
     quitting_ = true;
     loop_.stop();

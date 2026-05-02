@@ -37,7 +37,9 @@ private:
         std::string_view help;
         // whether an empty line repeats it
         bool repeatable;
-        void (CliFrontend::*handler)(Args args);
+        // whether it takes a /modifier, e.g. "x/16"
+        bool takes_modifier;
+        void (CliFrontend::*handler)(std::string_view modifier, Args args);
     };
 
     static std::span<const Command> commands();
@@ -51,17 +53,20 @@ private:
     void prompt();
     void print_location();
     bool launch(Args args);
+    void set_register(std::string_view name, std::string_view value_str);
+    void set_memory(std::string_view modifier, std::string_view location_str, std::string_view value_str);
 
-    void cmd_run(Args args);
-    void cmd_starti(Args args);
-    void cmd_continue(Args args);
-    void cmd_stepi(Args args);
-    void cmd_kill(Args args);
-    void cmd_info(Args args);
-    void cmd_set(Args args);
-    void cmd_file(Args args);
-    void cmd_help(Args args);
-    void cmd_quit(Args args);
+    void cmd_run(std::string_view modifier, Args args);
+    void cmd_starti(std::string_view modifier, Args args);
+    void cmd_continue(std::string_view modifier, Args args);
+    void cmd_stepi(std::string_view modifier, Args args);
+    void cmd_kill(std::string_view modifier, Args args);
+    void cmd_info(std::string_view modifier, Args args);
+    void cmd_examine(std::string_view modifier, Args args);
+    void cmd_set(std::string_view modifier, Args args);
+    void cmd_file(std::string_view modifier, Args args);
+    void cmd_help(std::string_view modifier, Args args);
+    void cmd_quit(std::string_view modifier, Args args);
 
     EventLoop& loop_;
     B& backend_;
