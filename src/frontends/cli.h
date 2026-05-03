@@ -1,6 +1,7 @@
 #ifndef FRONTENDS_CLI_H_
 #define FRONTENDS_CLI_H_
 
+#include <cstddef>
 #include <optional>
 #include <span>
 #include <string>
@@ -77,6 +78,9 @@ private:
     std::optional<EventLoop::Handle> input_watch_;
     std::string pending_input_;
     std::string last_command_;
+    // where the last x ended and how many bytes it showed, so x with no location can continue
+    std::optional<typename B::address> next_examine_;
+    std::size_t examine_count_ = 16;
     bool quitting_ = false;
 
     int interrupt_fd_ = -1;

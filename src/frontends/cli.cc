@@ -73,7 +73,7 @@ auto CliFrontend<B>::commands() -> std::span<const Command> {
         Command{"stepi", "si", "stepi", "execute one instruction", true, false, &CliFrontend::cmd_stepi},
         Command{"kill", "k", "kill", "kill the program", false, false, &CliFrontend::cmd_kill},
         Command{"info", "i", "info registers [regs...]", "show registers (\"i r\" for short)", true, false, &CliFrontend::cmd_info},
-        Command{"x", "", "x[/N] <location>", "show N bytes of memory (default 16)", false, true, &CliFrontend::cmd_examine},
+        Command{"x", "", "x[/N] [location]", "show N bytes of memory (default 16), continuing from the last x if no location", true, true, &CliFrontend::cmd_examine},
         Command{"set", "", "set[/N] $<reg>|*<location> = <value>", "set a register, or N bytes of memory (default 8)", false, true, &CliFrontend::cmd_set},
         Command{"file", "", "file <path>", "set the program to debug", false, false, &CliFrontend::cmd_file},
         Command{"help", "h", "help", "show this message", false, false, &CliFrontend::cmd_help},
@@ -364,42 +364,51 @@ void CliFrontend<B>::cmd_examine(std::string_view modifier, Args args) {
     // cap it so a typo doesn't try to dump gigabytes
     constexpr std::size_t MAX_COUNT = 65536;
 
-    std::size_t count = 16;
+    // count sticks around for later x's, same as gdb
     if (!modifier.empty()) {
         auto n = parse_integer<std::size_t>(modifier);
         if (!n || *n == 0 || *n > MAX_COUNT) {
             std::println("Invalid count `{}', must be 1 to {}", modifier, MAX_COUNT);
             return;
         }
-        count = *n;
+        examine_count_ = *n;
     }
 
+    typename B::address address;
     if (args.empty()) {
-        std::println("Usage: x[/N] <location>");
-        return;
+        if (!next_examine_) {
+            std::println("Usage: x[/N] [location]");
+            return;
+        }
+        address = *next_examine_;
+    } else {
+        auto location = backend_.parse_location(join(args));
+        if (!location) {
+            std::println("{}", location.error().message());
+            return;
+        }
+
+        auto resolved = backend_.resolve(*location);
+        if (!resolved) {
+            std::println("{}", resolved.error().message());
+            return;
+        }
+        address = *resolved;
     }
 
-    auto location = backend_.parse_location(join(args));
-    if (!location) {
-        std::println("{}", location.error().message());
-        return;
-    }
-
-    auto address = backend_.resolve(*location);
-    if (!address) {
-        std::println("{}", address.error().message());
-        return;
-    }
-
-    std::vector<std::byte> bytes(count);
-    if (auto ret = backend_.read_memory(*address, bytes); !ret) {
+    std::vector<std::byte> bytes(examine_count_);
+    if (auto ret = backend_.read_memory(address, bytes); !ret) {
         std::println("{}", ret.error().message());
         return;
     }
 
+    // repeating with an empty line becomes a plain x, which continues from here
+    next_examine_ = address + bytes.size();
+    last_command_ = "x";
+
     // hexdump style, 16 bytes per row with the printable ones on the right
     constexpr std::size_t ROW_SIZE = 16;
-    std::size_t address_width = 2 + 2 * sizeof(*address);
+    std::size_t address_width = 2 + 2 * sizeof(address);
     for (std::size_t row = 0; row < bytes.size(); row += ROW_SIZE) {
         std::string hex;
         std::string ascii;
@@ -417,7 +426,7 @@ void CliFrontend<B>::cmd_examine(std::string_view modifier, Args args) {
             ascii += (byte >= 0x20 && byte < 0x7f) ? static_cast<char>(byte) : '.';
         }
 
-        std::println("{:#0{}x}:  {} |{}|", *address + row, address_width, hex, ascii);
+        std::println("{:#0{}x}:  {} |{}|", address + row, address_width, hex, ascii);
     }
 }
 
