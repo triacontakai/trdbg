@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <csignal>
@@ -5,6 +6,7 @@
 #include <fcntl.h>
 #include <format>
 #include <system_error>
+#include <sys/personality.h>
 #include <sys/ptrace.h>
 #include <sys/signalfd.h>
 #include <sys/wait.h>
@@ -62,6 +64,8 @@ constexpr std::array REGISTER_ORDER = {
 // unordered_map for faster lookup of registers than using REGISTER_ORDER
 const std::unordered_map<std::string_view, std::size_t> REGISTER_OFFSETS(
     REGISTER_ORDER.begin(), REGISTER_ORDER.end());
+
+constexpr std::byte INT3{0xcc};
 
 template<typename T>
 concept Pointer = std::is_pointer_v<T>;
@@ -180,6 +184,9 @@ std::expected<void, BackendError> Linux64Backend::launch(std::string_view path, 
         sigemptyset(&empty);
         sigprocmask(SIG_SETMASK, &empty, nullptr);
 
+        // disables ASLR so addresses (and breakpoints on them) stay the same between runs
+        personality(personality(0xffffffff) | ADDR_NO_RANDOMIZE);
+
         if (ptrace(PTRACE_TRACEME) == 0)
             execvp(argv[0], argv.data());
 
@@ -208,6 +215,12 @@ std::expected<void, BackendError> Linux64Backend::launch(std::string_view path, 
     if (auto event = wait(); !event)
         return std::unexpected(event.error());
 
+    // breakpoints from before the process existed (or from the last run) go in now
+    for (auto& bp : breakpoints_) {
+        if (auto addr = resolve(bp.location); addr && insert_int3(*addr))
+            bp.address = *addr;
+    }
+
     return {};
 }
 
@@ -218,6 +231,10 @@ std::expected<void, BackendError> Linux64Backend::attach(int pid) {
 std::expected<void, BackendError> Linux64Backend::resume() {
     if (auto ok = check_stopped(); !ok)
         return ok;
+
+    // can't run straight through an int3 we put at pc, step off it first
+    if (at_breakpoint())
+        return start_step_over(true);
 
     if (ptrace(PTRACE_CONT, pid_, 0, pending_signal_) == -1)
         return errno_error();
@@ -230,6 +247,9 @@ std::expected<void, BackendError> Linux64Backend::resume() {
 std::expected<void, BackendError> Linux64Backend::step() {
     if (auto ok = check_stopped(); !ok)
         return ok;
+
+    if (at_breakpoint())
+        return start_step_over(false);
 
     if (ptrace(PTRACE_SINGLESTEP, pid_, 0, pending_signal_) == -1)
         return errno_error();
@@ -288,8 +308,15 @@ std::expected<void, BackendError> Linux64Backend::set_registers(const registers&
 }
 
 auto Linux64Backend::parse_location(std::string_view str) -> std::expected<location, BackendError> {
-    if (auto addr = parse_integer<address>(str))
-        return location{*addr};
+    // addresses need * - bare words are left for symbols/line numbers later
+    if (str.starts_with('*')) {
+        auto addr_str = str.substr(1);
+        addr_str.remove_prefix(std::min(addr_str.find_first_not_of(' '), addr_str.size()));
+        if (auto addr = parse_integer<address>(addr_str))
+            return location{*addr};
+    } else if (parse_integer<address>(str)) {
+        return std::unexpected(std::format("invalid location `{}' (addresses are written *{})", str, str));
+    }
 
     return std::unexpected(std::format("invalid location `{}'", str));
 }
@@ -299,12 +326,79 @@ auto Linux64Backend::resolve(const location& loc) -> std::expected<address, Back
 }
 
 std::expected<void, BackendError> Linux64Backend::read_memory(address addr, std::span<std::byte> out) {
-    return access_memory(addr, out.data(), out.size(), false);
+    if (auto ok = access_memory(addr, out.data(), out.size(), false); !ok)
+        return ok;
+
+    // show what's really there instead of our int3s
+    auto first = original_bytes_.lower_bound(addr);
+    auto last = original_bytes_.lower_bound(addr + out.size());
+    for (auto it = first; it != last; ++it)
+        out[it->first - addr] = it->second;
+
+    return {};
 }
 
 std::expected<void, BackendError> Linux64Backend::write_memory(address addr, std::span<const std::byte> in) {
-    // pwrite doesn't modify buf, the cast is just so read and write can share access_memory
-    return access_memory(addr, const_cast<std::byte *>(in.data()), in.size(), true);
+    // writing over a breakpoint changes what's under its int3, the int3 itself stays
+    std::vector<std::byte> buf(in.begin(), in.end());
+    auto first = original_bytes_.lower_bound(addr);
+    auto last = original_bytes_.lower_bound(addr + buf.size());
+    for (auto it = first; it != last; ++it)
+        buf[it->first - addr] = INT3;
+
+    if (auto ok = access_memory(addr, buf.data(), buf.size(), true); !ok)
+        return ok;
+
+    for (auto it = first; it != last; ++it)
+        it->second = in[it->first - addr];
+
+    return {};
+}
+
+auto Linux64Backend::add_breakpoint(const location& loc) -> std::expected<BreakpointId, BackendError> {
+    breakpoint bp{next_breakpoint_id_, loc, std::nullopt};
+
+    if (pid_ != 0) {
+        if (auto ok = check_stopped(); !ok)
+            return std::unexpected(ok.error());
+
+        auto addr = resolve(loc);
+        if (!addr)
+            return std::unexpected(addr.error());
+
+        if (auto ok = insert_int3(*addr); !ok)
+            return std::unexpected(ok.error());
+
+        bp.address = *addr;
+    }
+
+    next_breakpoint_id_++;
+    breakpoints_.push_back(bp);
+    return bp.id;
+}
+
+std::expected<void, BackendError> Linux64Backend::remove_breakpoint(BreakpointId id) {
+    auto bp = std::ranges::find(breakpoints_, id, &breakpoint::id);
+    if (bp == breakpoints_.end())
+        return std::unexpected(std::format("no breakpoint number {}", id));
+
+    std::optional<address> addr = bp->address;
+    if (addr) {
+        if (auto ok = check_stopped(); !ok)
+            return ok;
+    }
+
+    breakpoints_.erase(bp);
+
+    // other breakpoints at the same address share the int3
+    if (addr && std::ranges::find(breakpoints_, addr, &breakpoint::address) == breakpoints_.end())
+        return remove_int3(*addr);
+
+    return {};
+}
+
+auto Linux64Backend::breakpoints() const -> std::vector<breakpoint> {
+    return breakpoints_;
 }
 
 std::expected<void, BackendError> Linux64Backend::send_signal(int signal) {
@@ -326,9 +420,9 @@ void Linux64Backend::handle_signal_fd() {
     // the handler might resume the process, so keep going until nothing is left
     int status;
     while (pid_ != 0 && waitpid(pid_, &status, WNOHANG) > 0) {
-        StopEvent event = handle_status(status);
-        if (event_handler_)
-            event_handler_(event);
+        auto event = handle_status(status);
+        if (event && event_handler_)
+            event_handler_(*event);
     }
 }
 
@@ -360,41 +454,182 @@ std::expected<void, BackendError> Linux64Backend::access_memory(address addr, st
     return {};
 }
 
-// blocking wait that skips the event loop, for when we need the result right away
-std::expected<StopEvent, BackendError> Linux64Backend::wait() {
-    int status;
-    int ret;
-    do {
-        ret = waitpid(pid_, &status, 0);
-    } while (ret == -1 && errno == EINTR);
-
-    if (ret == -1)
-        return errno_error();
-
-    return handle_status(status);
+std::expected<void, BackendError> Linux64Backend::poke_byte(address addr, std::byte value) {
+    return access_memory(addr, &value, 1, true);
 }
 
-StopEvent Linux64Backend::handle_status(int status) {
+// blocking wait that skips the event loop, for when we need the result right away
+std::expected<StopEvent, BackendError> Linux64Backend::wait() {
+    // handle_status swallows the stop at the end of a step over, so keep going until there's a real event
+    while (true) {
+        int status;
+        int ret;
+        do {
+            ret = waitpid(pid_, &status, 0);
+        } while (ret == -1 && errno == EINTR);
+
+        if (ret == -1)
+            return errno_error();
+
+        if (auto event = handle_status(status))
+            return *event;
+    }
+}
+
+// empty when the stop was just part of stepping over a breakpoint, and the process is running again
+std::optional<StopEvent> Linux64Backend::handle_status(int status) {
     if (WIFEXITED(status)) {
-        pid_ = 0;
-        stopped_ = false;
+        forget_process();
         return StopEvent{StopEvent::Reason::Exited, WEXITSTATUS(status)};
     }
 
     if (WIFSIGNALED(status)) {
-        pid_ = 0;
-        stopped_ = false;
+        forget_process();
         return StopEvent{StopEvent::Reason::Killed, WTERMSIG(status)};
     }
 
-    // SIGTRAP and SIGSTOP are from us, anything else should be passed on to the process
-    // except SIGINT, which we reserve for frontend use (ctrl-c interrupt)
     int signal = WSTOPSIG(status);
+    stopped_ = true;
+
+    if (step_over_) {
+        // done stepping off a breakpoint (or something interrupted it), put its int3 back
+        address addr = *step_over_;
+        step_over_.reset();
+        bool then_continue = std::exchange(continue_after_step_over_, false);
+        // if this fails there's nothing better to do than carry on without the breakpoint
+        if (original_bytes_.contains(addr))
+            (void)poke_byte(addr, INT3);
+
+        if (signal == SIGTRAP) {
+            if (!then_continue)
+                return StopEvent{StopEvent::Reason::Stopped, signal};
+
+            if (ptrace(PTRACE_CONT, pid_, 0, 0) == 0) {
+                stopped_ = false;
+                return std::nullopt;
+            }
+        }
+        // anything else gets reported like a normal stop
+    }
+
+    if (signal == SIGTRAP) {
+        // pc is just past the int3, back up so the original instruction runs on resume
+        if (auto addr = trapped_breakpoint(); addr && set_pc(*addr)) {
+            auto bp = std::ranges::find(breakpoints_, addr, &breakpoint::address);
+
+            // technically not strictly necessary (this should never fail),
+            // but might as well make sure
+            if (bp != breakpoints_.end())
+                return StopEvent{StopEvent::Reason::Breakpoint, static_cast<int>(bp->id)};
+        }
+    }
+
+    // signals get passed on to the process when it resumes, except:
+    // - SIGTRAP, since stepping and exec report with it, and the program's own int3s get swallowed like in gdb
+    // - SIGSTOP, which is usually from interrupt() (passing it on properly needs group-stop handling)
+    // - SIGINT, which we reserve for frontend use (ctrl-c interrupt)
     if (signal != SIGTRAP && signal != SIGSTOP && signal != SIGINT)
         pending_signal_ = signal;
 
-    stopped_ = true;
     return StopEvent{StopEvent::Reason::Stopped, signal};
+}
+
+void Linux64Backend::forget_process() {
+    pid_ = 0;
+    stopped_ = false;
+
+    // forget the patched bytes/int3 data now that process is gone
+    original_bytes_.clear();
+    step_over_.reset();
+    continue_after_step_over_ = false;
+    for (auto& bp : breakpoints_)
+        bp.address.reset();
+}
+
+std::expected<void, BackendError> Linux64Backend::insert_int3(address addr) {
+    // other breakpoints at the same address share the int3
+    if (original_bytes_.contains(addr))
+        return {};
+
+    std::byte original;
+    if (auto ok = access_memory(addr, &original, 1, false); !ok)
+        return ok;
+
+    if (auto ok = poke_byte(addr, INT3); !ok)
+        return ok;
+
+    original_bytes_.emplace(addr, original);
+    return {};
+}
+
+std::expected<void, BackendError> Linux64Backend::remove_int3(address addr) {
+    auto found = original_bytes_.find(addr);
+    if (found == original_bytes_.end())
+        return {};
+
+    std::byte original = found->second;
+    original_bytes_.erase(found);
+    return poke_byte(addr, original);
+}
+
+bool Linux64Backend::at_breakpoint() {
+    auto regs = get_registers();
+    return regs && original_bytes_.contains(regs->pc());
+}
+
+// puts the original instruction back and single steps it
+// the second half of this is done in handle_status, which puts the int3 back
+std::expected<void, BackendError> Linux64Backend::start_step_over(bool then_continue) {
+    auto regs = get_registers();
+    if (!regs)
+        return std::unexpected(regs.error());
+
+    address addr = regs->pc();
+    if (auto ok = poke_byte(addr, original_bytes_.at(addr)); !ok)
+        return ok;
+
+    if (ptrace(PTRACE_SINGLESTEP, pid_, 0, pending_signal_) == -1) {
+        int err = errno;
+        (void)poke_byte(addr, INT3);
+        return errno_error(err);
+    }
+
+    // these fields are used to store context for handle_status
+    // PTRACE_SINGLESTEP raises another SIGTRAP, which will hit handle_status
+    step_over_ = addr;
+    continue_after_step_over_ = then_continue;
+    stopped_ = false;
+    pending_signal_ = 0;
+    return {};
+}
+
+// address of the breakpoint if the current SIGTRAP came from one of our int3s
+// int3 traps report SI_KERNEL, which tells them apart from a single step that lands just past a breakpoint
+std::optional<Linux64Backend::address> Linux64Backend::trapped_breakpoint() {
+    siginfo_t info;
+    if (ptrace(PTRACE_GETSIGINFO, pid_, 0, &info) == -1 || info.si_code != SI_KERNEL)
+        return std::nullopt;
+
+    auto regs = get_registers();
+    if (!regs)
+        return std::nullopt;
+
+    // pc is just past the int3
+    address addr = regs->pc() - 1;
+    if (!original_bytes_.contains(addr))
+        return std::nullopt;
+
+    return addr;
+}
+
+std::expected<void, BackendError> Linux64Backend::set_pc(address addr) {
+    auto regs = get_registers();
+    if (!regs)
+        return std::unexpected(regs.error());
+
+    // rip always exists, so this can't fail
+    (void)regs->set_register("rip", addr);
+    return set_registers(*regs);
 }
 
 std::expected<void, BackendError> Linux64Backend::setup_child_events() {

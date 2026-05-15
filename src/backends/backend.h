@@ -6,12 +6,14 @@
 #include <expected>
 #include <format>
 #include <functional>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <tuple>
+#include <vector>
 
 #include "event_loop.h"
 
@@ -43,11 +45,12 @@ private:
 
 /**
  * why the process stopped, passed to the on_event() handler
- * code is the signal number for Stopped/Killed, and exit status for Exited
+ * code is the signal number for Stopped/Killed, exit status for Exited, and breakpoint id for Breakpoint
  */
 struct StopEvent {
     enum class Reason {
         Stopped,
+        Breakpoint,
         Exited,
         Killed,
     };
@@ -69,6 +72,16 @@ enum class ProcessState {
  */
 template<typename T>
 concept Location = std::copyable<T> && std::formattable<T, char>;
+
+using BreakpointId = unsigned int;
+
+template<Location L, std::unsigned_integral A>
+struct Breakpoint {
+    BreakpointId id;
+    L location;
+    // where it's inserted right now, empty while it's pending (no process, or it couldn't be resolved/written)
+    std::optional<A> address;
+};
 
 template<typename T>
 concept RegisterSet =
@@ -98,6 +111,7 @@ concept Backend =
         typename T::address address,
         std::span<std::byte> out,
         std::span<const std::byte> in,
+        BreakpointId id,
         std::string_view path,
         std::span<const std::string> args,
         int pid,
@@ -120,6 +134,10 @@ concept Backend =
     { x.resolve(location) } -> std::same_as<std::expected<typename T::address, BackendError>>;
     { x.read_memory(address, out) } -> std::same_as<std::expected<void, BackendError>>;
     { x.write_memory(address, in) } -> std::same_as<std::expected<void, BackendError>>;
+
+    { x.add_breakpoint(location) } -> std::same_as<std::expected<BreakpointId, BackendError>>;
+    { x.remove_breakpoint(id) } -> std::same_as<std::expected<void, BackendError>>;
+    { x.breakpoints() } -> std::same_as<std::vector<Breakpoint<typename T::location, typename T::address>>>;
 };
 
 template<typename T>

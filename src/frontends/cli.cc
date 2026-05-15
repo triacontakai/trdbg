@@ -72,9 +72,11 @@ auto CliFrontend<B>::commands() -> std::span<const Command> {
         Command{"continue", "c", "continue", "resume the program", true, false, &CliFrontend::cmd_continue},
         Command{"stepi", "si", "stepi", "execute one instruction", true, false, &CliFrontend::cmd_stepi},
         Command{"kill", "k", "kill", "kill the program", false, false, &CliFrontend::cmd_kill},
-        Command{"info", "i", "info registers [regs...]", "show registers (\"i r\" for short)", true, false, &CliFrontend::cmd_info},
-        Command{"x", "", "x[/N] [location]", "show N bytes of memory (default 16), continuing from the last x if no location", true, true, &CliFrontend::cmd_examine},
-        Command{"set", "", "set[/N] $<reg>|*<location> = <value>", "set a register, or N bytes of memory (default 8)", false, true, &CliFrontend::cmd_set},
+        Command{"info", "i", "info registers [regs...]|breakpoints", "show registers or breakpoints (\"i r\", \"i b\" for short)", true, false, &CliFrontend::cmd_info},
+        Command{"x", "", "x[/N] [addr|location]", "show N bytes of memory (default 16), continuing from the last x if no address", true, true, &CliFrontend::cmd_examine},
+        Command{"set", "", "set[/N] $<reg>|<location> = <value>", "set a register, or N bytes of memory (default 8)", false, true, &CliFrontend::cmd_set},
+        Command{"break", "b", "break <location>", "set a breakpoint", false, false, &CliFrontend::cmd_break},
+        Command{"delete", "d", "delete [ids...]", "delete breakpoints, or all of them if no ids", false, false, &CliFrontend::cmd_delete},
         Command{"file", "", "file <path>", "set the program to debug", false, false, &CliFrontend::cmd_file},
         Command{"help", "h", "help", "show this message", false, false, &CliFrontend::cmd_help},
         Command{"quit", "q", "quit", "exit tdb, killing the program if it's running", false, false, &CliFrontend::cmd_quit},
@@ -210,6 +212,10 @@ void CliFrontend<B>::handle_event(StopEvent event) {
             std::println("\nProgram received signal {}.", describe_signal(event.code));
         print_location();
         break;
+    case StopEvent::Reason::Breakpoint:
+        std::println("\nBreakpoint {} hit.", event.code);
+        print_location();
+        break;
     case StopEvent::Reason::Exited:
         if (event.code == 0)
             std::println("[Process exited normally]");
@@ -324,11 +330,16 @@ void CliFrontend<B>::cmd_kill(std::string_view, Args) {
 
 template<backends::Backend B>
 void CliFrontend<B>::cmd_info(std::string_view, Args args) {
-    if (args.empty() || (args[0] != "registers" && args[0] != "r")) {
-        std::println("Usage: info registers [regs...]");
-        return;
-    }
+    if (!args.empty() && (args[0] == "registers" || args[0] == "r"))
+        info_registers(args.subspan(1));
+    else if (!args.empty() && (args[0] == "breakpoints" || args[0] == "b"))
+        info_breakpoints();
+    else
+        std::println("Usage: info registers [regs...]|breakpoints");
+}
 
+template<backends::Backend B>
+void CliFrontend<B>::info_registers(Args names) {
     auto regs = backend_.get_registers();
     if (!regs) {
         std::println("{}", regs.error().message());
@@ -345,18 +356,48 @@ void CliFrontend<B>::cmd_info(std::string_view, Args args) {
         std::println("{:<{}}  {:<#{}x}  {}", name, name_width, value, hex_width, value);
     };
 
-    if (args.size() == 1) {
+    if (names.empty()) {
         for (auto [name, value] : *regs)
             print_register(name, value.get());
         return;
     }
 
-    for (auto name : args.subspan(1)) {
+    for (auto name : names) {
         if (auto value = regs->get_register(name))
             print_register(name, *value);
         else
             std::println("Invalid register `{}'", name);
     }
+}
+
+template<backends::Backend B>
+void CliFrontend<B>::info_breakpoints() {
+    auto breakpoints = backend_.breakpoints();
+    if (breakpoints.empty()) {
+        std::println("No breakpoints.");
+        return;
+    }
+
+    std::vector<std::array<std::string, 3>> rows = {{"Num", "Location", "Address"}};
+    std::size_t address_width = 2 + 2 * sizeof(typename B::address);
+    for (auto const& bp : breakpoints) {
+        rows.push_back({
+            std::to_string(bp.id),
+            std::format("{}", bp.location),
+            bp.address ? std::format("{:#0{}x}", *bp.address, address_width) : "pending",
+        });
+    }
+
+    // columns fit the longest entry
+    std::size_t num_width = 0;
+    std::size_t location_width = 0;
+    for (auto const& row : rows) {
+        num_width = std::max(num_width, row[0].size());
+        location_width = std::max(location_width, row[1].size());
+    }
+
+    for (auto const& row : rows)
+        std::println("{:<{}}  {:<{}}  {}", row[0], num_width, row[1], location_width, row[2]);
 }
 
 template<backends::Backend B>
@@ -377,10 +418,13 @@ void CliFrontend<B>::cmd_examine(std::string_view modifier, Args args) {
     typename B::address address;
     if (args.empty()) {
         if (!next_examine_) {
-            std::println("Usage: x[/N] [location]");
+            std::println("Usage: x[/N] [addr|location]");
             return;
         }
         address = *next_examine_;
+    } else if (auto number = parse_integer<typename B::address>(join(args))) {
+        // plain numbers are addresses, anything else is a location
+        address = *number;
     } else {
         auto location = backend_.parse_location(join(args));
         if (!location) {
@@ -438,7 +482,7 @@ void CliFrontend<B>::cmd_set(std::string_view modifier, Args args) {
     auto equals = assignment.find('=');
     auto target = trim(std::string_view(assignment).substr(0, equals));
     if (equals == std::string::npos || target.empty()) {
-        std::println("Usage: set[/N] $<reg>|*<location> = <value>");
+        std::println("Usage: set[/N] $<reg>|<location> = <value>");
         return;
     }
 
@@ -449,10 +493,8 @@ void CliFrontend<B>::cmd_set(std::string_view modifier, Args args) {
             return;
         }
         set_register(target.substr(1), value_str);
-    } else if (target.starts_with('*')) {
-        set_memory(modifier, trim(target.substr(1)), value_str);
     } else {
-        std::println("Usage: set[/N] $<reg>|*<location> = <value>");
+        set_memory(modifier, target, value_str);
     }
 }
 
@@ -516,6 +558,53 @@ void CliFrontend<B>::set_memory(std::string_view modifier, std::string_view loca
 
     if (auto ret = backend_.write_memory(*address, std::span(bytes).first(size)); !ret)
         std::println("{}", ret.error().message());
+}
+
+template<backends::Backend B>
+void CliFrontend<B>::cmd_break(std::string_view, Args args) {
+    if (args.empty()) {
+        std::println("Usage: break <location>");
+        return;
+    }
+
+    auto location = backend_.parse_location(join(args));
+    if (!location) {
+        std::println("{}", location.error().message());
+        return;
+    }
+
+    auto id = backend_.add_breakpoint(*location);
+    if (!id) {
+        std::println("{}", id.error().message());
+        return;
+    }
+
+    if (backend_.state() == ProcessState::None)
+        std::println("Breakpoint {} at {} (pending until the program starts)", *id, *location);
+    else
+        std::println("Breakpoint {} at {}", *id, *location);
+}
+
+template<backends::Backend B>
+void CliFrontend<B>::cmd_delete(std::string_view, Args args) {
+    if (args.empty()) {
+        for (auto const& bp : backend_.breakpoints()) {
+            if (auto ret = backend_.remove_breakpoint(bp.id); !ret)
+                std::println("{}", ret.error().message());
+        }
+        return;
+    }
+
+    for (auto arg : args) {
+        auto id = parse_integer<backends::BreakpointId>(arg);
+        if (!id) {
+            std::println("Invalid breakpoint number `{}'", arg);
+            continue;
+        }
+
+        if (auto ret = backend_.remove_breakpoint(*id); !ret)
+            std::println("{}", ret.error().message());
+    }
 }
 
 template<backends::Backend B>

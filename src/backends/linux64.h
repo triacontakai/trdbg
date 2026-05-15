@@ -6,9 +6,12 @@
 #include <format>
 #include <functional>
 #include <iterator>
+#include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 #include <unistd.h>
 #include <sys/user.h>
 
@@ -58,16 +61,29 @@ private:
     friend class Linux64Backend;
 };
 
-// only raw addresses for now, symbols etc. will go here later
+// only raw addresses (written *addr) for now, symbols etc. will go here later
 struct Linux64Location {
     std::uint64_t address;
 };
+
+}
+
+// has to come before anything that needs Location<Linux64Location>, like Breakpoint
+template<>
+struct std::formatter<tdb::backends::Linux64Location> : std::formatter<std::string> {
+    auto format(const tdb::backends::Linux64Location& loc, auto& ctx) const {
+        return std::formatter<std::string>::format(std::format("*{:#x}", loc.address), ctx);
+    }
+};
+
+namespace tdb::backends {
 
 class Linux64Backend {
 public:
     using registers = Amd64Registers;
     using location = Linux64Location;
     using address = std::uint64_t;
+    using breakpoint = Breakpoint<location, address>;
 
     explicit Linux64Backend(EventLoop& loop) : loop_(loop) {};
     Linux64Backend(const Linux64Backend&) = delete;
@@ -96,6 +112,11 @@ public:
     std::expected<void, BackendError> read_memory(address addr, std::span<std::byte> out);
     std::expected<void, BackendError> write_memory(address addr, std::span<const std::byte> in);
 
+    // with no process the breakpoint is pending, and gets inserted on the next launch
+    std::expected<BreakpointId, BackendError> add_breakpoint(const location& loc);
+    std::expected<void, BackendError> remove_breakpoint(BreakpointId id);
+    std::vector<breakpoint> breakpoints() const;
+
     std::expected<void, BackendError> send_signal(int signal);
 
 private:
@@ -104,27 +125,38 @@ private:
     void handle_signal_fd();
     std::expected<StopEvent, BackendError> wait();
     std::expected<void, BackendError> access_memory(address addr, std::byte *buf, std::size_t size, bool write);
-    StopEvent handle_status(int status);
+    std::expected<void, BackendError> poke_byte(address addr, std::byte value);
+    std::optional<StopEvent> handle_status(int status);
+    void forget_process();
+
+    std::expected<void, BackendError> insert_int3(address addr);
+    std::expected<void, BackendError> remove_int3(address addr);
+    bool at_breakpoint();
+    std::expected<void, BackendError> start_step_over(bool then_continue);
+    std::optional<address> trapped_breakpoint();
+    std::expected<void, BackendError> set_pc(address addr);
 
     EventLoop& loop_;
     std::function<void(StopEvent)> event_handler_;
 
     pid_t pid_ = 0;
     bool stopped_ = false;
+
     // signal to deliver on next resume/step
     int pending_signal_ = 0;
 
     int signal_fd_ = -1;
     EventLoop::Handle signal_fd_watch_;
+
+    std::vector<breakpoint> breakpoints_;
+    BreakpointId next_breakpoint_id_ = 1;
+    // what was under each int3 we've written, keyed by address (so the keys are also where the int3s are)
+    std::map<address, std::byte> original_bytes_;
+    // set while single stepping off a breakpoint, so its int3 can go back in once the step is done
+    std::optional<address> step_over_;
+    bool continue_after_step_over_ = false;
 };
 
 }
-
-template<>
-struct std::formatter<tdb::backends::Linux64Location> : std::formatter<std::string> {
-    auto format(const tdb::backends::Linux64Location& loc, auto& ctx) const {
-        return std::formatter<std::string>::format(std::format("{:#x}", loc.address), ctx);
-    }
-};
 
 #endif
