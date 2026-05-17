@@ -4,6 +4,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <print>
 #include <ranges>
 #include <span>
@@ -11,6 +12,7 @@
 #include <string.h>
 #include <sys/signalfd.h>
 #include <unistd.h>
+#include <editline/readline.h>
 #include <utility>
 #include <vector>
 #include "backends/native.h"
@@ -23,6 +25,8 @@ using backends::ProcessState;
 using backends::StopEvent;
 
 namespace {
+constexpr const char *PROMPT = "(tdb) ";
+
 std::string_view trim(std::string_view s) {
     auto start = s.find_first_not_of(" \t\r");
     if (start == std::string_view::npos)
@@ -89,8 +93,9 @@ CliFrontend<B>::CliFrontend(EventLoop& loop, B& backend) : loop_(loop), backend_
 
 template<backends::Backend B>
 CliFrontend<B>::~CliFrontend() {
-    if (input_watch_)
-        loop_.unwatch(*input_watch_);
+    stop_input();
+    if (active_ == this)
+        active_ = nullptr;
 
     if (interrupt_fd_ != -1) {
         loop_.unwatch(interrupt_watch_);
@@ -121,12 +126,66 @@ void CliFrontend<B>::start(Target target) {
             pthread_sigmask(SIG_UNBLOCK, &mask, nullptr);
     }
 
+    // readline-style editing needs a terminal, piped input (scripts, tests) gets read plainly
+    interactive_ = isatty(STDIN_FILENO);
+    if (interactive_) {
+        active_ = this;
+        // SIGINT comes through interrupt_fd_ instead
+        rl_catch_signals = 0;
+    }
+
+    start_input();
+}
+
+template<backends::Backend B>
+void CliFrontend<B>::readline_handler(char *line) {
+    active_->handle_readline(line);
+}
+
+// shows the prompt and starts watching stdin, or just shows a fresh prompt if we already are
+template<backends::Backend B>
+void CliFrontend<B>::start_input() {
+    if (input_watch_) {
+        if (interactive_) {
+            // libedit leaves the terminal in cooked mode after each line until the next key comes in,
+            // so the prompt wouldn't show and keys would echo raw - reinstalling puts it back in edit mode now
+            rl_callback_handler_remove();
+            rl_callback_handler_install(PROMPT, &CliFrontend::readline_handler);
+        } else {
+            prompt();
+        }
+        return;
+    }
+
+    if (interactive_)
+        rl_callback_handler_install(PROMPT, &CliFrontend::readline_handler);
+    else
+        prompt();
+
     input_watch_ = loop_.watch_fd(STDIN_FILENO, [this] { handle_input(); });
-    prompt();
+}
+
+// gives the terminal back in its normal mode, for the process while it runs or for exiting
+template<backends::Backend B>
+void CliFrontend<B>::stop_input() {
+    if (!input_watch_)
+        return;
+
+    if (interactive_)
+        rl_callback_handler_remove();
+
+    loop_.unwatch(*input_watch_);
+    input_watch_.reset();
 }
 
 template<backends::Backend B>
 void CliFrontend<B>::handle_input() {
+    if (interactive_) {
+        // reads one char, and calls readline_handler once there's a whole line
+        rl_callback_read_char();
+        return;
+    }
+
     // read the fd directly - std::cin would buffer lines that poll can't see
     char buf[256];
     ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
@@ -145,26 +204,51 @@ void CliFrontend<B>::handle_input() {
 }
 
 template<backends::Backend B>
+void CliFrontend<B>::handle_readline(char *line) {
+    if (!line) {
+        // ctrl-d on an empty line
+        std::println("quit");
+        cmd_quit({}, {});
+        return;
+    }
+
+    std::string command_line(line);
+    std::free(line);
+
+    if (!trim(command_line).empty())
+        add_history(command_line.c_str());
+
+    handle_line(command_line);
+    after_line();
+}
+
+template<backends::Backend B>
 void CliFrontend<B>::handle_pending_input() {
     for (auto newline = pending_input_.find('\n'); newline != std::string::npos; newline = pending_input_.find('\n')) {
         std::string line = pending_input_.substr(0, newline);
         pending_input_.erase(0, newline + 1);
         handle_line(line);
 
-        if (quitting_)
+        // the rest gets handled once the process stops
+        if (!after_line())
             return;
-
-        // stop reading while the process runs, the rest gets handled once it stops
-        if (backend_.state() == ProcessState::Running) {
-            if (input_watch_) {
-                loop_.unwatch(*input_watch_);
-                input_watch_.reset();
-            }
-            return;
-        }
-
-        prompt();
     }
+}
+
+// returns whether we're still reading commands
+template<backends::Backend B>
+bool CliFrontend<B>::after_line() {
+    if (quitting_)
+        return false;
+
+    // stop reading while the process runs, input starts again when it stops
+    if (backend_.state() == ProcessState::Running) {
+        stop_input();
+        return false;
+    }
+
+    start_input();
+    return true;
 }
 
 template<backends::Backend B>
@@ -206,6 +290,10 @@ void CliFrontend<B>::handle_line(std::string_view line) {
 
 template<backends::Backend B>
 void CliFrontend<B>::handle_event(StopEvent event) {
+    // the prompt can already be up if the process died while stopped (e.g. killed from outside)
+    if (input_watch_ && interactive_)
+        std::println();
+
     switch (event.reason) {
     case StopEvent::Reason::Stopped:
         if (event.code != SIGTRAP)
@@ -230,11 +318,9 @@ void CliFrontend<B>::handle_event(StopEvent event) {
     if (quitting_)
         return;
 
-    if (!input_watch_)
-        input_watch_ = loop_.watch_fd(STDIN_FILENO, [this] { handle_input(); });
-
-    prompt();
-    handle_pending_input();
+    start_input();
+    if (!interactive_)
+        handle_pending_input();
 }
 
 template<backends::Backend B>
@@ -246,15 +332,21 @@ void CliFrontend<B>::handle_interrupt() {
     if (backend_.state() == ProcessState::Running)
         return;
 
-    // the terminal throws away the half typed line, so do the same
-    pending_input_.clear();
-    std::println("Quit");
-    prompt();
+    // throw away the half typed line, like ctrl-c in a shell
+    if (interactive_) {
+        rl_replace_line("", 0);
+        std::println("\nQuit");
+        start_input();
+    } else {
+        pending_input_.clear();
+        std::println("Quit");
+        prompt();
+    }
 }
 
 template<backends::Backend B>
 void CliFrontend<B>::prompt() {
-    std::print("(tdb) ");
+    std::print("{}", PROMPT);
     std::fflush(stdout);
 }
 
@@ -632,6 +724,7 @@ template<backends::Backend B>
 void CliFrontend<B>::cmd_quit(std::string_view, Args) {
     // backend kills the process when it gets destroyed
     quitting_ = true;
+    stop_input();
     loop_.stop();
 }
 

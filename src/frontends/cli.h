@@ -15,7 +15,7 @@
 namespace tdb::frontends {
 
 /**
- * gdb style prompt on stdin/stdout
+ * gdb style prompt on stdin/stdout, with line editing and history (libedit) when stdin is a terminal
  * input is only read while the process is stopped, so the process gets the terminal while it runs
  */
 template<backends::Backend B>
@@ -45,8 +45,14 @@ private:
 
     static std::span<const Command> commands();
 
+    static void readline_handler(char *line);
+
+    void start_input();
+    void stop_input();
     void handle_input();
+    void handle_readline(char *line);
     void handle_pending_input();
+    bool after_line();
     void handle_line(std::string_view line);
     void handle_event(backends::StopEvent event);
     void handle_interrupt();
@@ -79,7 +85,13 @@ private:
     // from the last run/starti, reused when they're given no args
     std::vector<std::string> args_;
 
+    // libedit is global state, so its callback finds us through this (only one CliFrontend can use it)
+    inline static CliFrontend *active_ = nullptr;
+    // false when stdin isn't a terminal, then lines are read plainly instead of through libedit
+    bool interactive_ = false;
+    // set while reading commands, i.e. not while the process is running
     std::optional<EventLoop::Handle> input_watch_;
+    // only used when not interactive, libedit does its own line buffering
     std::string pending_input_;
     std::string last_command_;
     // where the last x ended and how many bytes it showed, so x with no location can continue
