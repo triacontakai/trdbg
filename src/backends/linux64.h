@@ -11,12 +11,14 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 #include <unistd.h>
 #include <sys/user.h>
 
 #include "backend.h"
 #include "event_loop.h"
+#include "symbols/elf.h"
 
 namespace tdb::backends {
 
@@ -61,9 +63,18 @@ private:
     friend class Linux64Backend;
 };
 
-// only raw addresses (written *addr) for now, symbols etc. will go here later
+// a raw address (written *addr) or a symbol with an optional offset (written name or name+offset)
 struct Linux64Location {
-    std::uint64_t address;
+    struct Address {
+        std::uint64_t address;
+    };
+
+    struct Symbol {
+        std::string name;
+        std::uint64_t offset;
+    };
+
+    std::variant<Address, Symbol> value;
 };
 
 }
@@ -72,7 +83,14 @@ struct Linux64Location {
 template<>
 struct std::formatter<tdb::backends::Linux64Location> : std::formatter<std::string> {
     auto format(const tdb::backends::Linux64Location& loc, auto& ctx) const {
-        return std::formatter<std::string>::format(std::format("*{:#x}", loc.address), ctx);
+        std::string str;
+        if (auto addr = std::get_if<tdb::backends::Linux64Location::Address>(&loc.value)) {
+            str = std::format("*{:#x}", addr->address);
+        } else {
+            auto const& sym = std::get<tdb::backends::Linux64Location::Symbol>(loc.value);
+            str = sym.offset == 0 ? sym.name : std::format("{}+{}", sym.name, sym.offset);
+        }
+        return std::formatter<std::string>::format(str, ctx);
     }
 };
 
@@ -117,6 +135,10 @@ public:
     std::expected<void, BackendError> remove_breakpoint(BreakpointId id);
     std::vector<breakpoint> breakpoints() const;
 
+    // also reread on every launch, in case the program got rebuilt
+    std::expected<void, BackendError> load_executable(std::string_view path);
+    std::optional<location> symbolize(address addr) const;
+
     std::expected<void, BackendError> send_signal(int signal);
 
 private:
@@ -135,6 +157,7 @@ private:
     std::expected<void, BackendError> start_step_over(bool then_continue);
     std::optional<address> trapped_breakpoint();
     std::expected<void, BackendError> set_pc(address addr);
+    std::expected<address, BackendError> read_load_offset();
 
     EventLoop& loop_;
     std::function<void(StopEvent)> event_handler_;
@@ -155,6 +178,10 @@ private:
     // set while single stepping off a breakpoint, so its int3 can go back in once the step is done
     std::optional<address> step_over_;
     bool continue_after_step_over_ = false;
+
+    std::optional<symbols::ElfSymbols> symbols_;
+    // what to add to symbol values to get runtime addresses, only known for PIE once the process exists
+    std::optional<address> load_offset_;
 };
 
 }

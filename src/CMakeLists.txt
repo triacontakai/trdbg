@@ -1,6 +1,7 @@
 add_library(event_loop STATIC event_loop.cc)
 target_include_directories(event_loop PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+add_subdirectory(symbols)
 add_subdirectory(backends)
 add_subdirectory(frontends)
 

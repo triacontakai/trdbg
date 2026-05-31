@@ -138,6 +138,11 @@ concept Backend =
     { x.add_breakpoint(location) } -> std::same_as<std::expected<BreakpointId, BackendError>>;
     { x.remove_breakpoint(id) } -> std::same_as<std::expected<void, BackendError>>;
     { x.breakpoints() } -> std::same_as<std::vector<Breakpoint<typename T::location, typename T::address>>>;
+
+    // symbols for the program, so locations can use them before it's running
+    { x.load_executable(path) } -> std::same_as<std::expected<void, BackendError>>;
+    // the symbol (as a location) that an address is in, if any
+    { x.symbolize(address) } -> std::same_as<std::optional<typename T::location>>;
 };
 
 template<typename T>

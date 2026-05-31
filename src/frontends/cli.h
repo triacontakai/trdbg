@@ -59,6 +59,7 @@ private:
 
     void prompt();
     void print_location();
+    void load_symbols();
     bool launch(Args args);
     void set_register(std::string_view name, std::string_view value_str);
     void set_memory(std::string_view modifier, std::string_view location_str, std::string_view value_str);

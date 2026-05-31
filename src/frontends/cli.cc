@@ -111,6 +111,7 @@ CliFrontend<B>::~CliFrontend() {
 template<backends::Backend B>
 void CliFrontend<B>::start(Target target) {
     target_ = std::move(target);
+    load_symbols();
     backend_.on_event([this](StopEvent event) { handle_event(event); });
 
     // ctrl-c goes to the whole foreground process group, so the process gets it too and stops by itself
@@ -352,10 +353,26 @@ void CliFrontend<B>::prompt() {
 
 template<backends::Backend B>
 void CliFrontend<B>::print_location() {
-    if (auto regs = backend_.get_registers())
-        std::println("Stopped at {:#018x}", regs->pc());
-    else
+    auto regs = backend_.get_registers();
+    if (!regs) {
         std::println("{}", regs.error().message());
+        return;
+    }
+
+    if (auto symbol = backend_.symbolize(regs->pc()))
+        std::println("Stopped at {:#018x} <{}>", regs->pc(), *symbol);
+    else
+        std::println("Stopped at {:#018x}", regs->pc());
+}
+
+// not having symbols isn't fatal, addresses still work
+template<backends::Backend B>
+void CliFrontend<B>::load_symbols() {
+    if (target_.path.empty())
+        return;
+
+    if (auto ret = backend_.load_executable(target_.path); !ret)
+        std::println("No symbols loaded: {}", ret.error().message());
 }
 
 template<backends::Backend B>
@@ -707,6 +724,7 @@ void CliFrontend<B>::cmd_file(std::string_view, Args args) {
     }
 
     target_.path = args[0];
+    load_symbols();
 }
 
 template<backends::Backend B>

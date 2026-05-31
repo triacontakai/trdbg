@@ -3,13 +3,16 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
+#include <elf.h>
 #include <fcntl.h>
 #include <format>
+#include <fstream>
 #include <system_error>
 #include <sys/personality.h>
 #include <sys/ptrace.h>
 #include <sys/signalfd.h>
 #include <sys/wait.h>
+#include <tuple>
 #include <type_traits>
 #include <unistd.h>
 #include <unordered_map>
@@ -66,6 +69,13 @@ const std::unordered_map<std::string_view, std::size_t> REGISTER_OFFSETS(
     REGISTER_ORDER.begin(), REGISTER_ORDER.end());
 
 constexpr std::byte INT3{0xcc};
+
+std::string_view trim(std::string_view s) {
+    auto start = s.find_first_not_of(' ');
+    if (start == std::string_view::npos)
+        return {};
+    return s.substr(start, s.find_last_not_of(' ') - start + 1);
+}
 
 template<typename T>
 concept Pointer = std::is_pointer_v<T>;
@@ -215,6 +225,11 @@ std::expected<void, BackendError> Linux64Backend::launch(std::string_view path, 
     if (auto event = wait(); !event)
         return std::unexpected(event.error());
 
+    // symbols get reread in case the program was rebuilt
+    // PIE executables require the runtime base address
+    // we ignore error here since this just means no available symbols
+    std::ignore = load_executable(path);
+
     // breakpoints from before the process existed (or from the last run) go in now
     for (auto& bp : breakpoints_) {
         if (auto addr = resolve(bp.location); addr && insert_int3(*addr))
@@ -310,19 +325,47 @@ std::expected<void, BackendError> Linux64Backend::set_registers(const registers&
 auto Linux64Backend::parse_location(std::string_view str) -> std::expected<location, BackendError> {
     // addresses need * - bare words are left for symbols/line numbers later
     if (str.starts_with('*')) {
-        auto addr_str = str.substr(1);
-        addr_str.remove_prefix(std::min(addr_str.find_first_not_of(' '), addr_str.size()));
-        if (auto addr = parse_integer<address>(addr_str))
-            return location{*addr};
-    } else if (parse_integer<address>(str)) {
-        return std::unexpected(std::format("invalid location `{}' (addresses are written *{})", str, str));
+        if (auto addr = parse_integer<address>(trim(str.substr(1))))
+            return location{location::Address{*addr}};
+        return std::unexpected(std::format("invalid location `{}'", str));
     }
 
-    return std::unexpected(std::format("invalid location `{}'", str));
+    if (parse_integer<address>(str))
+        return std::unexpected(std::format("invalid location `{}' (addresses are written *{})", str, str));
+
+    // anything else is a symbol, optionally with +offset
+    std::string_view name = str;
+    address offset = 0;
+    if (auto plus = str.find('+'); plus != std::string_view::npos) {
+        name = trim(str.substr(0, plus));
+        auto parsed = parse_integer<address>(trim(str.substr(plus + 1)));
+        if (!parsed)
+            return std::unexpected(std::format("invalid offset in `{}'", str));
+        offset = *parsed;
+    }
+
+    if (name.empty())
+        return std::unexpected(std::format("invalid location `{}'", str));
+    if (!symbols_)
+        return std::unexpected(std::format("no symbol `{}' (no symbols loaded)", name));
+    if (!symbols_->find(name))
+        return std::unexpected(std::format("no symbol `{}'", name));
+
+    return location{location::Symbol{std::string(name), offset}};
 }
 
 auto Linux64Backend::resolve(const location& loc) -> std::expected<address, BackendError> {
-    return loc.address;
+    if (auto addr = std::get_if<location::Address>(&loc.value))
+        return addr->address;
+
+    auto const& sym = std::get<location::Symbol>(loc.value);
+    auto found = symbols_ ? symbols_->find(sym.name) : std::nullopt;
+    if (!found)
+        return std::unexpected(std::format("no symbol `{}'", sym.name));
+    if (!load_offset_)
+        return std::unexpected(std::format("can't resolve `{}' until the program is running", sym.name));
+
+    return *load_offset_ + found->value + sym.offset;
 }
 
 std::expected<void, BackendError> Linux64Backend::read_memory(address addr, std::span<std::byte> out) {
@@ -399,6 +442,41 @@ std::expected<void, BackendError> Linux64Backend::remove_breakpoint(BreakpointId
 
 auto Linux64Backend::breakpoints() const -> std::vector<breakpoint> {
     return breakpoints_;
+}
+
+std::expected<void, BackendError> Linux64Backend::load_executable(std::string_view path) {
+    // symbols from whatever was loaded before shouldn't stick around if this fails
+    symbols_.reset();
+    load_offset_.reset();
+
+    auto loaded = symbols::ElfSymbols::load(std::string(path));
+    if (!loaded)
+        return std::unexpected(loaded.error());
+
+    symbols_ = std::move(*loaded);
+
+    // non-PIE executables get loaded where they were linked, PIE ones only get a base once they're running
+    if (!symbols_->pie()) {
+        load_offset_ = 0;
+    } else if (pid_ != 0) {
+        if (auto offset = read_load_offset())
+            load_offset_ = *offset;
+    }
+
+    return {};
+}
+
+auto Linux64Backend::symbolize(address addr) const -> std::optional<location> {
+    if (!symbols_ || !load_offset_)
+        return std::nullopt;
+
+    // where it'd be without the load offset, which is what symbol values are
+    address link_addr = addr - *load_offset_;
+    auto sym = symbols_->containing(link_addr);
+    if (!sym)
+        return std::nullopt;
+
+    return location{location::Symbol{sym->name, link_addr - sym->value}};
 }
 
 std::expected<void, BackendError> Linux64Backend::send_signal(int signal) {
@@ -498,7 +576,7 @@ std::optional<StopEvent> Linux64Backend::handle_status(int status) {
         bool then_continue = std::exchange(continue_after_step_over_, false);
         // if this fails there's nothing better to do than carry on without the breakpoint
         if (original_bytes_.contains(addr))
-            (void)poke_byte(addr, INT3);
+            std::ignore = poke_byte(addr, INT3);
 
         if (signal == SIGTRAP) {
             if (!then_continue)
@@ -537,6 +615,10 @@ std::optional<StopEvent> Linux64Backend::handle_status(int status) {
 void Linux64Backend::forget_process() {
     pid_ = 0;
     stopped_ = false;
+
+    // a PIE executable could load somewhere else next time
+    if (symbols_ && symbols_->pie())
+        load_offset_.reset();
 
     // forget the patched bytes/int3 data now that process is gone
     original_bytes_.clear();
@@ -590,7 +672,7 @@ std::expected<void, BackendError> Linux64Backend::start_step_over(bool then_cont
 
     if (ptrace(PTRACE_SINGLESTEP, pid_, 0, pending_signal_) == -1) {
         int err = errno;
-        (void)poke_byte(addr, INT3);
+        std::ignore = poke_byte(addr, INT3);
         return errno_error(err);
     }
 
@@ -622,13 +704,27 @@ std::optional<Linux64Backend::address> Linux64Backend::trapped_breakpoint() {
     return addr;
 }
 
+// load offset = AT_ENTRY (from aux vector) - e_entry (defined in ELF)
+std::expected<Linux64Backend::address, BackendError> Linux64Backend::read_load_offset() {
+    std::ifstream auxv(std::format("/proc/{}/auxv", pid_), std::ios::binary);
+    Elf64_auxv_t entry;
+    while (auxv.read(reinterpret_cast<char *>(&entry), sizeof(entry))) {
+        if (entry.a_type == AT_ENTRY)
+            return entry.a_un.a_val - symbols_->entry();
+        if (entry.a_type == AT_NULL)
+            break;
+    }
+
+    return std::unexpected(std::string("couldn't find the entry point in auxv"));
+}
+
 std::expected<void, BackendError> Linux64Backend::set_pc(address addr) {
     auto regs = get_registers();
     if (!regs)
         return std::unexpected(regs.error());
 
     // rip always exists, so this can't fail
-    (void)regs->set_register("rip", addr);
+    std::ignore = regs->set_register("rip", addr);
     return set_registers(*regs);
 }
 
