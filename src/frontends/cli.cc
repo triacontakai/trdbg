@@ -25,7 +25,7 @@ using backends::ProcessState;
 using backends::StopEvent;
 
 namespace {
-constexpr const char *PROMPT = "(tdb) ";
+constexpr const char *PROMPT = "(trdbg) ";
 
 std::string_view trim(std::string_view s) {
     auto start = s.find_first_not_of(" \t\r");
