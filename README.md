@@ -21,3 +21,15 @@ Currently supports Linux x86-64 binaries.
   * classes for managing the user-interactible portion of the application
 * `src/symbols/`
   * classes for managing parsing/retrieval of debug symbols from binaries
+
+## Build
+
+Release:
+```
+./scripts/build.sh
+```
+
+Debug:
+```
+./scripts/build.sh debug
+```
